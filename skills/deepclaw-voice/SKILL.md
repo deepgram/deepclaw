@@ -173,11 +173,11 @@ def get_agent_config(public_url: str) -> dict:
         },
         "agent": {
             "language": "en",
-            "listen": {"provider": {"type": "deepgram", "model": "nova-3"}},
+            "listen": {"provider": {"type": "deepgram", "model": "flux-general-en"}},
             "think": {
                 "provider": {"type": "open_ai", "model": "gpt-4o-mini"},
                 "endpoint": {"url": f"{public_url}/v1/chat/completions", "headers": {"x-proxy-secret": PROXY_SECRET}},
-                "prompt": "You are a helpful voice assistant on a phone call. Keep responses concise (1-3 sentences). Never use markdown, lists, or emojis.",
+                "prompt": "You are a helpful voice assistant on a phone call. Keep responses concise and conversational (1-3 sentences). Never use markdown, bullet points, numbered lists, or emojis - your responses will be spoken aloud.",
             },
             "speak": {"provider": {"type": "deepgram", "model": "aura-2-thalia-en"}},
             "greeting": "Hello! How can I help you?",
@@ -243,7 +243,8 @@ async def twilio_media_websocket(websocket: WebSocket):
                         logger.info(f"{event.get('role', '').capitalize()}: {event.get('content', '')}")
                     elif event_type == "Error":
                         logger.error(f"Deepgram error: {event}")
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"Deepgram connection closed: code={e.code}, reason={e.reason}")
                 break
             except Exception as e:
                 logger.error(f"Error: {e}")
@@ -263,8 +264,10 @@ async def twilio_media_websocket(websocket: WebSocket):
                 host = websocket.headers.get("host", "localhost:8000")
                 public_url = f"https://{host}"
                 logger.info(f"Stream started: {stream_sid}")
-                await deepgram_ws.send(json.dumps(get_agent_config(public_url)))
-                logger.info("Sent agent config")
+                logger.info(f"LLM endpoint URL: {public_url}/v1/chat/completions")
+                config = get_agent_config(public_url)
+                await deepgram_ws.send(json.dumps(config))
+                logger.info("Sent agent config to Deepgram")
                 sender_task = asyncio.create_task(send_to_deepgram())
                 receiver_task = asyncio.create_task(receive_from_deepgram())
                 break
