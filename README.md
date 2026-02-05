@@ -1,6 +1,6 @@
 # deepclaw
 
-Call your OpenClaw over the phone with Deepgram Flux + Aura-2.
+Call your OpenClaw over the phone using the [Deepgram Voice Agent API](https://developers.deepgram.com/docs/voice-agent-api).
 
 ## Why Deepgram?
 
@@ -15,21 +15,24 @@ Deepgram Flux understands *when you're done talking* semantically and acoustical
 
 ## How It Works
 
+deepclaw uses the [Deepgram Voice Agent API](https://developers.deepgram.com/docs/voice-agent-api)—a single WebSocket that handles STT, TTS, turn-taking, and barge-in together.
+
 ```
-Phone Call → Twilio → deepclaw → Deepgram Flux (STT)
+Phone Call → Twilio → deepclaw ←──WebSocket──→ Deepgram Voice Agent API
+                         │                      (Flux STT + Aura-2 TTS)
+                         │
                          ↓
                     OpenClaw (LLM)
-                         ↓
-                  Deepgram Aura-2 (TTS) → Twilio → Phone Call
 ```
 
 1. You call your Twilio number
-2. Twilio streams audio to deepclaw
-3. Flux transcribes with semantic turn detection
-4. OpenClaw processes the request
-5. Aura-2 speaks the response back to you
+2. Twilio streams audio to deepclaw via WebSocket
+3. deepclaw forwards audio to Deepgram Voice Agent API
+4. Flux transcribes with semantic turn detection
+5. Deepgram calls your LLM endpoint (OpenClaw via deepclaw proxy)
+6. Aura-2 speaks the response, streamed back through Twilio
 
-**Barge-in support:** Start talking while the assistant is speaking and it stops immediately.
+**Barge-in support:** Start talking while the assistant is speaking and it stops immediately—handled natively by the Voice Agent API.
 
 ## Quick Setup (Let OpenClaw Do It)
 
@@ -131,24 +134,29 @@ Pick up the phone and talk to your OpenClaw!
 ## Architecture
 
 ```
-┌─────────────┐     ┌─────────────────────────────────────────────────┐
-│   Caller    │     │                  Your Machine                   │
-│  (Phone)    │     │                                                 │
-└──────┬──────┘     │  ┌───────────┐   ┌──────────┐   ┌───────────┐  │
-       │            │  │  Twilio   │   │ deepclaw │   │ OpenClaw  │  │
-       │ PSTN       │  │  Webhook  │──▶│  Server  │──▶│  Gateway  │  │
-       │            │  └───────────┘   └────┬─────┘   └───────────┘  │
-       ▼            │                       │                        │
-┌──────────────┐    │         ┌─────────────┴─────────────┐          │
-│    Twilio    │◀───┼─────────│                           │          │
-│  (SIP/Media) │    │         ▼                           ▼          │
-└──────────────┘    │  ┌─────────────┐           ┌─────────────┐     │
-       │            │  │ Deepgram    │           │ Deepgram    │     │
-       │            │  │ Flux (STT)  │           │ Aura-2 (TTS)│     │
-       └────────────┼──│ WebSocket   │           │ REST API    │     │
-         Audio      │  └─────────────┘           └─────────────┘     │
-                    └─────────────────────────────────────────────────┘
+┌─────────────┐     ┌──────────────────────────────────────────────────────┐
+│   Caller    │     │                   Your Machine                        │
+│  (Phone)    │     │                                                       │
+└──────┬──────┘     │  ┌───────────┐   ┌───────────┐   ┌───────────────┐   │
+       │            │  │  Twilio   │   │ deepclaw  │   │   OpenClaw    │   │
+       │ PSTN       │  │  Webhook  │──▶│  Server   │──▶│   Gateway     │   │
+       │            │  └───────────┘   └─────┬─────┘   └───────────────┘   │
+       ▼            │                        │                              │
+┌──────────────┐    │                        │ WebSocket                    │
+│    Twilio    │◀───┼────────────────────────┤                              │
+│  (SIP/Media) │    │                        ▼                              │
+└──────────────┘    │              ┌───────────────────┐                    │
+       │            │              │ Deepgram Voice    │                    │
+       │  Audio     │              │ Agent API         │                    │
+       └────────────┼─────────────▶│ • Flux (STT)      │                    │
+                    │              │ • Aura-2 (TTS)    │                    │
+                    │              │ • Turn detection  │                    │
+                    │              │ • Barge-in        │                    │
+                    │              └───────────────────┘                    │
+                    └──────────────────────────────────────────────────────┘
 ```
+
+The Voice Agent API handles the entire speech pipeline in a single WebSocket connection. deepclaw bridges Twilio's media stream to the Voice Agent API and proxies LLM requests to your local OpenClaw.
 
 ## Customizing Voice
 
@@ -176,7 +184,7 @@ See `skills/deepclaw-voice/SKILL.md` for the complete voice list (80+ voices in 
 
 ## Security Considerations
 
-deepclaw is designed for local development and testing. Be aware of these security considerations:
+Be aware of these security considerations when using OpenClaw and deepclaw. Like the rest of OpenClaw, use at your own risk.
 
 **1. LLM proxy endpoint has no authentication**
 - The `/v1/chat/completions` endpoint is unauthenticated
@@ -264,16 +272,6 @@ Open an issue describing:
 - Add comments for complex logic
 - Update documentation for user-facing changes
 
-## Performance
-
-deepclaw logs latency metrics for every turn:
-
-```
-Latencies - OpenClaw: 1250ms, TTS TTFB: 87ms, Total: 1337ms
-```
-
-Use these to prove you're faster than ElevenLabs.
-
 ## License
 
 MIT
@@ -281,7 +279,8 @@ MIT
 ## Credits
 
 Built with:
-- [Deepgram Flux](https://deepgram.com/product/speech-to-text) — Conversational speech recognition
-- [Deepgram Aura-2](https://deepgram.com/product/text-to-speech) — Enterprise text-to-speech
+- [Deepgram Voice Agent API](https://developers.deepgram.com/docs/voice-agent-api) — Real-time conversational AI pipeline
+- [Deepgram Flux](https://deepgram.com/product/speech-to-text) — Semantic speech recognition
+- [Deepgram Aura-2](https://deepgram.com/product/text-to-speech) — Low-latency text-to-speech
 - [OpenClaw](https://github.com/openclaw/openclaw) — Open-source AI assistant
 - [Twilio](https://www.twilio.com/) — Phone infrastructure
