@@ -1,6 +1,6 @@
 # deepclaw
 
-Call your OpenClaw over the phone using the [Deepgram Voice Agent API](https://developers.deepgram.com/docs/voice-agent-api).
+Call your OpenClaw over the phone using the [Deepgram Voice Agent API](https://developers.deepgram.com/docs/voice-agent).
 
 ## Why Deepgram?
 
@@ -15,7 +15,7 @@ Deepgram Flux understands *when you're done talking* semantically and acoustical
 
 ## How It Works
 
-deepclaw uses the [Deepgram Voice Agent API](https://developers.deepgram.com/docs/voice-agent-api)—a single WebSocket that handles STT, TTS, turn-taking, and barge-in together.
+deepclaw uses the [Deepgram Voice Agent API](https://developers.deepgram.com/docs/voice-agent)—a single WebSocket that handles STT, TTS, turn-taking, and barge-in together.
 
 ```
 Phone Call → Twilio → deepclaw ←──WebSocket──→ Deepgram Voice Agent API
