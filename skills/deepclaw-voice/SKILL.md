@@ -156,10 +156,106 @@ Format: `aura-2-<name>-<lang>` (e.g., `aura-2-estrella-es`)
 
 ## Troubleshooting
 
-**"Application error" on call:** Check server is running, ngrok URL matches Twilio webhook
+When something goes wrong, check the server logs first. Here's how to diagnose common issues:
 
-**Silence:** Verify Deepgram key, check OpenClaw gateway running on 18789
+### No server logs when calling
 
-**Immediate hang-up:** Check server logs for errors. Try setting `PROXY_AUTH_ENABLED=false` in .env
+**Symptom:** You call, phone hangs up, but no logs appear in the server terminal.
 
-**ngrok URL changed:** Update Twilio webhook. Use fixed domain: `ngrok http 8000 --domain=yourname.ngrok-free.app`
+**Cause:** Twilio webhook URL doesn't match your ngrok URL.
+
+**Fix:**
+1. Check your current ngrok URL in the ngrok terminal
+2. Go to Twilio Console → Phone Numbers → Your Number → Voice Configuration
+3. Make sure the webhook URL matches exactly: `https://<your-ngrok-url>/twilio/incoming`
+4. Save and try again
+
+### "Check your think provider settings" error
+
+**Symptom:** Call connects, you hear the greeting, then Deepgram says "Check your think provider settings" and hangs up.
+
+**Cause:** Deepgram can't reach the LLM proxy endpoint, or it's returning an error.
+
+**Fix:**
+1. Test the proxy endpoint directly:
+   ```bash
+   curl -X POST https://<your-ngrok-url>/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+   ```
+2. If you get `401 Unauthorized`, the auth is blocking requests. This shouldn't happen with the latest code.
+3. If you get connection refused, the server isn't running or ngrok isn't forwarding.
+4. Check that OpenClaw gateway is running: `curl http://127.0.0.1:18789/health`
+
+### Call works once then hangs up
+
+**Symptom:** First exchange works (greeting + one response), then call drops with "FAILED_TO_THINK" in logs.
+
+**Cause:** SSE stream formatting issue—usually fixed in latest code.
+
+**Fix:**
+1. Make sure you have the latest code: `cd ~/deepclaw && git pull`
+2. Restart the server
+
+### Words running together in speech
+
+**Symptom:** TTS says "Whydo you want" instead of "Why do you want"
+
+**Cause:** Markdown stripping was removing spaces between streaming chunks.
+
+**Fix:**
+1. Update to latest code: `cd ~/deepclaw && git pull`
+2. Restart the server
+
+### Inbound calls don't work, but everything else does
+
+**Symptom:** Server responds to curl, ngrok works, but calling from your phone gets immediate disconnect with no logs.
+
+**Cause:** Your carrier may be blocking calls to the Twilio number, or you're dialing wrong.
+
+**Fix:**
+1. Verify you're dialing the exact Twilio number (with country code if needed)
+2. Try calling from a different phone
+3. Test with an outbound call from Twilio to you:
+   ```python
+   # Run this in Python with your .env loaded
+   import requests
+   requests.post(
+       f'https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Calls.json',
+       auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+       data={
+           'To': '+1YOURNUMBER',
+           'From': '+1TWILIONUMBER',
+           'Url': 'https://<your-ngrok-url>/twilio/incoming'
+       }
+   )
+   ```
+   If this works, the issue is your carrier blocking outbound calls to Twilio.
+
+### OpenClaw returns errors
+
+**Symptom:** Logs show errors from OpenClaw like "No API key found for provider"
+
+**Fix:**
+1. Make sure OpenClaw is configured with your Anthropic API key
+2. Run `openclaw configure --section model` to set it up
+3. Restart OpenClaw gateway: `openclaw daemon restart`
+
+### ngrok URL keeps changing
+
+**Symptom:** Every time you restart ngrok, you get a new URL and have to update Twilio.
+
+**Fix:** Use a fixed ngrok domain (requires ngrok account):
+```bash
+ngrok http 8000 --domain=your-chosen-name.ngrok-free.app
+```
+
+### Still stuck?
+
+1. Check the server logs carefully—they usually tell you what's wrong
+2. Test each component individually:
+   - Server health: `curl http://localhost:8000/health`
+   - ngrok forwarding: `curl https://<ngrok-url>/health`
+   - OpenClaw gateway: `curl http://127.0.0.1:18789/health`
+   - LLM proxy: `curl -X POST https://<ngrok-url>/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}'`
+3. Open an issue at https://github.com/deepgram/deepclaw/issues
