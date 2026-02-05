@@ -35,6 +35,17 @@ OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
+# Voice Provider Configuration
+VOICE_PROVIDER = os.getenv("VOICE_PROVIDER", "twilio").lower()
+
+# Twilio Configuration
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+
+# Telnyx Configuration
+TELNYX_API_KEY = os.getenv("TELNYX_API_KEY", "")
+TELNYX_PUBLIC_KEY = os.getenv("TELNYX_PUBLIC_KEY", "")
+
 # Generate a random proxy secret on startup (Deepgram will send this back to us)
 PROXY_SECRET = os.getenv("PROXY_SECRET", secrets.token_hex(16))
 
@@ -375,6 +386,217 @@ async def twilio_media_websocket(websocket: WebSocket):
         logger.info("Cleanup complete")
 
 
+# ============================================================================
+# Telnyx Webhook & Media Stream
+# ============================================================================
+
+@app.post("/telnyx/webhook")
+async def telnyx_webhook(request: Request):
+    """Handle Telnyx webhook events - incoming calls and call control."""
+    body = await request.json()
+    event_type = body.get("data", {}).get("event_type", "")
+    
+    logger.info(f"Telnyx webhook received: {event_type}")
+    
+    if event_type == "call.initiated":
+        # Incoming call - answer and start media streaming
+        call_control_id = body["data"]["payload"]["call_control_id"]
+        
+        # Get the public URL from the request headers
+        host = request.headers.get("host", "localhost:8000")
+        stream_url = f"wss://{host}/telnyx/media"
+        
+        # Answer the call with media streaming
+        answer_data = {
+            "stream_url": stream_url,
+            "stream_track": "both_tracks"
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {TELNYX_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"https://api.telnyx.com/v2/calls/{call_control_id}/actions/answer",
+                    json=answer_data,
+                    headers=headers
+                )
+                logger.info(f"Answered Telnyx call: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Error answering Telnyx call: {e}")
+    
+    elif event_type == "call.answered":
+        logger.info("Telnyx call answered")
+    elif event_type == "call.hangup":
+        logger.info("Telnyx call ended")
+    elif event_type == "streaming.started":
+        logger.info("Telnyx media streaming started")
+    elif event_type == "streaming.stopped":
+        logger.info("Telnyx media streaming stopped")
+    
+    return {"status": "ok"}
+
+
+@app.websocket("/telnyx/media")
+async def telnyx_media_websocket(websocket: WebSocket):
+    """Bridge Telnyx media stream to Deepgram Voice Agent API."""
+    await websocket.accept()
+    logger.info("Telnyx WebSocket connected")
+    
+    call_control_id: str | None = None
+    stream_id: str | None = None
+    deepgram_ws = None
+    sender_task = None
+    receiver_task = None
+    
+    # Audio buffer for batching
+    audio_buffer = bytearray()
+    BUFFER_SIZE = 20 * 160  # 20 messages * 160 bytes = 0.4 seconds at 8kHz PCMU
+    
+    async def send_to_deepgram():
+        """Forward buffered audio from Telnyx to Deepgram."""
+        nonlocal audio_buffer
+        while True:
+            if len(audio_buffer) >= BUFFER_SIZE and deepgram_ws:
+                chunk = bytes(audio_buffer[:BUFFER_SIZE])
+                audio_buffer = audio_buffer[BUFFER_SIZE:]
+                try:
+                    await deepgram_ws.send(chunk)
+                except Exception as e:
+                    logger.error(f"Error sending to Deepgram: {e}")
+                    break
+            await asyncio.sleep(0.01)
+    
+    async def receive_from_deepgram():
+        """Receive audio/events from Deepgram and send to Telnyx."""
+        nonlocal call_control_id
+        while True:
+            try:
+                message = await deepgram_ws.recv()
+                
+                # Binary = audio data
+                if isinstance(message, bytes):
+                    if call_control_id:
+                        payload = base64.b64encode(message).decode("utf-8")
+                        media_msg = {
+                            "event": "media",
+                            "media": {"payload": payload}
+                        }
+                        await websocket.send_json(media_msg)
+                
+                # Text = JSON event
+                else:
+                    event = json.loads(message)
+                    event_type = event.get("type", "")
+                    
+                    if event_type == "Welcome":
+                        logger.info("Connected to Deepgram Voice Agent")
+                    elif event_type == "SettingsApplied":
+                        logger.info("Agent settings applied")
+                    elif event_type == "UserStartedSpeaking":
+                        logger.debug("User started speaking")
+                        # Clear any queued audio (barge-in)
+                        if call_control_id:
+                            await websocket.send_json({"event": "clear"})
+                    elif event_type == "AgentStartedSpeaking":
+                        logger.debug("Agent started speaking")
+                    elif event_type == "ConversationText":
+                        role = event.get("role", "")
+                        content = event.get("content", "")
+                        logger.info(f"{role.capitalize()}: {content}")
+                    elif event_type == "Error":
+                        logger.error(f"Deepgram error: {event}")
+            
+            except websockets.exceptions.ConnectionClosed:
+                logger.info("Deepgram connection closed")
+                break
+            except Exception as e:
+                logger.error(f"Error receiving from Deepgram: {e}")
+                break
+    
+    try:
+        # Connect to Deepgram Voice Agent API
+        deepgram_ws = await websockets.connect(
+            DEEPGRAM_AGENT_URL,
+            additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+        )
+        logger.info("Connected to Deepgram Voice Agent API")
+        
+        # Wait for stream to start
+        while True:
+            message = await websocket.receive_json()
+            event_type = message.get("event")
+            
+            if event_type == "connected":
+                logger.info("Telnyx media stream connected")
+            
+            elif event_type == "start":
+                # Extract call information from Telnyx start event
+                start_data = message.get("start", {})
+                call_control_id = start_data.get("call_control_id")
+                stream_id = message.get("stream_id")
+                
+                # Get the public URL from the websocket headers
+                host = websocket.headers.get("host", "localhost:8000")
+                public_url = f"https://{host}"
+                
+                logger.info(f"Telnyx stream started: call_control_id={call_control_id}, stream_id={stream_id}")
+                logger.info(f"Public URL for LLM proxy: {public_url}")
+                
+                # Send agent config with correct URL
+                config = get_agent_config(public_url)
+                await deepgram_ws.send(json.dumps(config))
+                logger.info("Sent agent config")
+                
+                # Start background tasks
+                sender_task = asyncio.create_task(send_to_deepgram())
+                receiver_task = asyncio.create_task(receive_from_deepgram())
+                break
+        
+        # Continue processing Telnyx messages
+        while True:
+            message = await websocket.receive_json()
+            event_type = message.get("event")
+            
+            if event_type == "media":
+                # Decode and buffer audio from Telnyx
+                media_data = message.get("media", {})
+                payload = media_data.get("payload", "")
+                if payload:
+                    audio_data = base64.b64decode(payload)
+                    audio_buffer.extend(audio_data)
+            
+            elif event_type == "stop":
+                logger.info("Telnyx stream stopped")
+                break
+            
+            elif event_type == "dtmf":
+                dtmf_data = message.get("dtmf", {})
+                digit = dtmf_data.get("digit", "")
+                logger.info(f"DTMF received: {digit}")
+            
+            elif event_type == "error":
+                error_data = message.get("payload", {})
+                logger.error(f"Telnyx error: {error_data}")
+    
+    except WebSocketDisconnect:
+        logger.info("Telnyx WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"Error in Telnyx media WebSocket: {e}")
+    finally:
+        # Cleanup
+        if sender_task:
+            sender_task.cancel()
+        if receiver_task:
+            receiver_task.cancel()
+        if deepgram_ws:
+            await deepgram_ws.close()
+        logger.info("Telnyx cleanup complete")
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -391,6 +613,27 @@ def main():
         return
     if not OPENCLAW_GATEWAY_TOKEN:
         logger.error("OPENCLAW_GATEWAY_TOKEN not set. Generate with: openssl rand -hex 32")
+        return
+    
+    # Validate voice provider configuration
+    if VOICE_PROVIDER == "twilio":
+        if not TWILIO_ACCOUNT_SID:
+            logger.error("TWILIO_ACCOUNT_SID not set for Twilio provider")
+            return
+        if not TWILIO_AUTH_TOKEN:
+            logger.error("TWILIO_AUTH_TOKEN not set for Twilio provider")
+            return
+        logger.info("Using Twilio as voice provider")
+    elif VOICE_PROVIDER == "telnyx":
+        if not TELNYX_API_KEY:
+            logger.error("TELNYX_API_KEY not set for Telnyx provider")
+            return
+        if not TELNYX_PUBLIC_KEY:
+            logger.error("TELNYX_PUBLIC_KEY not set for Telnyx provider")
+            return
+        logger.info("Using Telnyx as voice provider")
+    else:
+        logger.error(f"Invalid VOICE_PROVIDER: {VOICE_PROVIDER}. Must be 'twilio' or 'telnyx'")
         return
 
     logger.info(f"Starting deepclaw voice agent server on {HOST}:{PORT}")

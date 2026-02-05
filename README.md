@@ -13,24 +13,40 @@ Call your OpenClaw over the phone using the [Deepgram Voice Agent API](https://d
 
 Deepgram Flux understands *when you're done talking* semantically and acoustically—not just when you stop making noise. This means fewer awkward interruptions and faster responses.
 
+## Provider Comparison: Twilio vs Telnyx
+
+| Feature | Twilio | Telnyx |
+|---------|--------|--------|
+| **Setup Complexity** | Moderate | Easy |
+| **Phone Number Cost** | ~$1/month | ~$0.50-$2/month |
+| **Call Pricing** | $0.085/min | $0.005-$0.025/min |
+| **Media Streaming** | WebSocket + TwiML | WebSocket + REST API |
+| **Authentication** | Account SID + Auth Token | API Key + Public Key |
+| **Documentation** | Extensive | Growing |
+| **Global Coverage** | Excellent | Excellent |
+
+**Recommendation:**
+- **Twilio**: Better for production apps with extensive docs and ecosystem
+- **Telnyx**: More cost-effective, simpler API, better for experimenting
+
 ## How It Works
 
 deepclaw uses the [Deepgram Voice Agent API](https://developers.deepgram.com/docs/voice-agent)—a single WebSocket that handles STT, TTS, turn-taking, and barge-in together.
 
 ```
-Phone Call → Twilio → deepclaw ←──WebSocket──→ Deepgram Voice Agent API
-                         │                      (Flux STT + Aura-2 TTS)
-                         │
-                         ↓
-                    OpenClaw (LLM)
+Phone Call → Twilio/Telnyx → deepclaw ←──WebSocket──→ Deepgram Voice Agent API
+                                │                      (Flux STT + Aura-2 TTS)
+                                │
+                                ↓
+                           OpenClaw (LLM)
 ```
 
-1. You call your Twilio number
-2. Twilio streams audio to deepclaw via WebSocket
+1. You call your phone number
+2. **Twilio/Telnyx** streams audio to deepclaw via WebSocket
 3. deepclaw forwards audio to Deepgram Voice Agent API
 4. Flux transcribes with semantic turn detection
 5. Deepgram calls your LLM endpoint (OpenClaw via deepclaw proxy)
-6. Aura-2 speaks the response, streamed back through Twilio
+6. Aura-2 speaks the response, streamed back through your phone provider
 
 **Barge-in support:** Start talking while the assistant is speaking and it stops immediately—handled natively by the Voice Agent API.
 
@@ -56,7 +72,9 @@ OpenClaw will walk you through:
 
 - Python 3.10+
 - [Deepgram account](https://console.deepgram.com/) (free tier available, $200 credit)
-- [Twilio account](https://www.twilio.com/) with a phone number (~$1/month)
+- **Phone Provider** (choose one):
+  - [Twilio account](https://www.twilio.com/) with a phone number (~$1/month)
+  - [Telnyx account](https://telnyx.com/) with a phone number (~$0.50-$2/month)
 - [OpenClaw](https://github.com/openclaw/openclaw) running locally
 - [ngrok](https://ngrok.com/) for exposing your local server
 
@@ -76,10 +94,22 @@ cp .env.example .env
 
 Edit `.env` with your credentials:
 
+**For Twilio (default):**
 ```env
 DEEPGRAM_API_KEY=your_deepgram_api_key
+VOICE_PROVIDER=twilio
 TWILIO_ACCOUNT_SID=your_twilio_account_sid
 TWILIO_AUTH_TOKEN=your_twilio_auth_token
+OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+OPENCLAW_GATEWAY_TOKEN=your_openclaw_gateway_token
+```
+
+**For Telnyx:**
+```env
+DEEPGRAM_API_KEY=your_deepgram_api_key
+VOICE_PROVIDER=telnyx
+TELNYX_API_KEY=your_telnyx_api_key
+TELNYX_PUBLIC_KEY=your_telnyx_public_key
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 OPENCLAW_GATEWAY_TOKEN=your_openclaw_gateway_token
 ```
@@ -110,7 +140,9 @@ ngrok http 8000
 
 Note your ngrok URL (e.g., `https://abc123.ngrok-free.app`).
 
-### 5. Configure Twilio
+### 5. Configure Your Phone Provider
+
+#### Option A: Configure Twilio
 
 1. Go to your [Twilio Console](https://console.twilio.com/)
 2. Navigate to Phone Numbers → Manage → Active Numbers
@@ -120,6 +152,28 @@ Note your ngrok URL (e.g., `https://abc123.ngrok-free.app`).
    - URL: `https://your-ngrok-url.ngrok-free.app/twilio/incoming`
    - Method: **POST**
 5. Save
+
+#### Option B: Configure Telnyx
+
+1. Go to your [Telnyx Mission Control Portal](https://portal.telnyx.com/)
+2. Navigate to **Voice → Programmable Voice**
+3. Create a new **Voice API Application**:
+   - **Application Name**: `deepclaw-voice`
+   - **Webhook URL**: `https://your-ngrok-url.ngrok-free.app/telnyx/webhook`
+   - **Webhook API Version**: `API v2` (recommended)
+   - **Webhook Failover URL**: (optional) same as webhook URL
+4. Click **Create**
+5. Go to **Numbers → My Numbers**
+6. Click your phone number
+7. Under **Voice Settings**:
+   - **Connection**: Select your `deepclaw-voice` application
+8. Save configuration
+
+#### Getting Telnyx API Keys
+
+1. In Mission Control Portal, go to **API Keys**
+2. Create a new API Key or copy existing one
+3. For **Public Key**: Go to **Account → Public Key** and copy the key
 
 ### 6. Start deepclaw
 
@@ -138,18 +192,18 @@ Pick up the phone and talk to your OpenClaw!
 │   Caller    │     │                   Your Machine                        │
 │  (Phone)    │     │                                                       │
 └──────┬──────┘     │  ┌───────────┐   ┌───────────┐   ┌───────────────┐   │
-       │            │  │  Twilio   │   │ deepclaw  │   │   OpenClaw    │   │
-       │ PSTN       │  │  Webhook  │──▶│  Server   │──▶│   Gateway     │   │
-       │            │  └───────────┘   └─────┬─────┘   └───────────────┘   │
-       ▼            │                        │                              │
+       │            │  │ Twilio or │   │ deepclaw  │   │   OpenClaw    │   │
+       │ PSTN       │  │  Telnyx   │──▶│  Server   │──▶│   Gateway     │   │
+       │            │  │ Webhook   │   └─────┬─────┘   └───────────────┘   │
+       ▼            │  └───────────┘         │                              │
 ┌──────────────┐    │                        │ WebSocket                    │
-│    Twilio    │◀───┼────────────────────────┤                              │
-│  (SIP/Media) │    │                        ▼                              │
-└──────────────┘    │              ┌───────────────────┐                    │
-       │            │              │ Deepgram Voice    │                    │
-       │  Audio     │              │ Agent API         │                    │
-       └────────────┼─────────────▶│ • Flux (STT)      │                    │
-                    │              │ • Aura-2 (TTS)    │                    │
+│   Twilio/    │◀───┼────────────────────────┤                              │
+│   Telnyx     │    │                        ▼                              │
+│ (SIP/Media)  │    │              ┌───────────────────┐                    │
+└──────────────┘    │              │ Deepgram Voice    │                    │
+       │            │              │ Agent API         │                    │
+       │  Audio     │              │ • Flux (STT)      │                    │
+       └────────────┼─────────────▶│ • Aura-2 (TTS)    │                    │
                     │              │ • Turn detection  │                    │
                     │              │ • Barge-in        │                    │
                     │              └───────────────────┘                    │
