@@ -116,20 +116,23 @@ OPENCLAW_GATEWAY_TOKEN=your_openclaw_gateway_token
 
 ### 3. Configure OpenClaw
 
-In your `openclaw.json`, enable the chat completions endpoint:
+Enable the chat completions endpoint in your `openclaw.json`:
 
-```json
-{
-  "gateway": {
-    "http": {
-      "endpoints": {
-        "chatCompletions": {
-          "enabled": true
-        }
-      }
-    }
-  }
-}
+```bash
+openclaw config set gateway.http.endpoints.chatCompletions.enabled true
+```
+
+deepclaw automatically creates a dedicated `voice` agent in OpenClaw that uses a fast model (Claude Haiku 4.5) for low-latency phone conversations. This happens on first `python -m deepclaw` launch. To customize the model:
+
+```bash
+# Use a different model for voice (optional)
+export OPENCLAW_VOICE_MODEL=anthropic/claude-sonnet-4-5-20250929
+```
+
+Or create the agent manually:
+
+```bash
+openclaw agents add voice --model anthropic/claude-haiku-4-5-20251001
 ```
 
 ### 4. Start the tunnel

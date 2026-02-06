@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import secrets
+import shutil
+import subprocess
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -52,6 +54,44 @@ PROXY_SECRET = os.getenv("PROXY_SECRET", secrets.token_hex(16))
 DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse"
 
 app = FastAPI(title="deepclaw-voice-agent")
+
+# Map Deepgram caller IP → OpenClaw session key for the active call.
+# Deepgram sends LLM requests from a fixed IP per call session, so we
+# use the caller IP to correlate proxy requests with the right call.
+_active_sessions: dict[str, str] = {}
+
+
+async def prewarm_openclaw_session(session_key: str):
+    """Fire a throwaway request to OpenClaw to warm the session and prompt cache.
+
+    This creates the session file, loads skills/tools, and writes the
+    Anthropic prompt cache (~15 k tokens).  Subsequent requests in the
+    same session hit a warm cache and skip the cold-start penalty.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+        "X-OpenClaw-Session-Key": session_key,
+    }
+    body = {
+        "model": "openclaw/voice",
+        "stream": True,
+        "messages": [{"role": "user", "content": "warmup"}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream(
+                "POST",
+                f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
+                json=body,
+                headers=headers,
+            ) as response:
+                # Drain the stream so the session completes
+                async for _ in response.aiter_bytes():
+                    pass
+        logger.info("OpenClaw session pre-warmed: %s", session_key)
+    except Exception as exc:
+        logger.warning("Pre-warm failed (non-fatal): %s", exc)
 
 
 def strip_markdown(text: str) -> str:
@@ -94,21 +134,28 @@ async def proxy_chat_completions(request: Request):
     Proxy LLM requests from Deepgram Voice Agent to local OpenClaw.
     This eliminates the need for a second ngrok tunnel.
     """
-    # Auth disabled for debugging
     logger.info("LLM proxy request received")
 
     body = await request.json()
 
-    # Force fast model for voice interactions
-    body["model"] = "claude-haiku-4-5"
+    # Route to the 'voice' agent (configured with claude-haiku-4-5)
+    body["model"] = "openclaw/voice"
 
     stream = body.get("stream", False)
     logger.info(f"Proxying chat completion - stream={stream}, messages={len(body.get('messages', []))}")
+
+    # Look up the stable session key for this call.
+    # Deepgram's cloud IPs aren't known in advance, so we use
+    # a catch-all that maps to the most recent active call.
+    session_key = _active_sessions.get("_current")
 
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
     }
+    if session_key:
+        headers["X-OpenClaw-Session-Key"] = session_key
+        logger.info(f"Using session key: {session_key}")
 
     async def stream_response():
         """Stream the response from OpenClaw, stripping markdown for voice."""
@@ -120,26 +167,26 @@ async def proxy_chat_completions(request: Request):
                 json=body,
                 headers=headers,
             ) as response:
-                async for chunk in response.aiter_text():
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
                     chunk_count += 1
                     if chunk_count == 1:
                         logger.info("First chunk received from OpenClaw")
 
-                    # Process SSE lines
-                    for line in chunk.split('\n'):
-                        if line.startswith('data: ') and line != 'data: [DONE]':
-                            try:
-                                data = json.loads(line[6:])
-                                # Extract and clean content from delta
-                                if 'choices' in data and data['choices']:
-                                    delta = data['choices'][0].get('delta', {})
-                                    if 'content' in delta and delta['content']:
-                                        delta['content'] = strip_markdown(delta['content'])
-                                yield f"data: {json.dumps(data)}\n\n"
-                            except json.JSONDecodeError:
-                                yield f"{line}\n\n"
-                        elif line.strip():
+                    if line.startswith('data: ') and line != 'data: [DONE]':
+                        try:
+                            data = json.loads(line[6:])
+                            if 'choices' in data and data['choices']:
+                                delta = data['choices'][0].get('delta', {})
+                                if 'content' in delta and delta['content']:
+                                    delta['content'] = strip_markdown(delta['content'])
+                            yield f"data: {json.dumps(data)}\n\n"
+                        except json.JSONDecodeError as exc:
+                            logger.warning("Malformed SSE data: %s", exc)
                             yield f"{line}\n\n"
+                    elif line.strip():
+                        yield f"{line}\n\n"
 
                 logger.info(f"Stream complete: {chunk_count} chunks")
 
@@ -246,9 +293,11 @@ async def twilio_media_websocket(websocket: WebSocket):
     logger.info("Twilio WebSocket connected")
 
     stream_sid: str | None = None
+    session_key: str | None = None
     deepgram_ws = None
     sender_task = None
     receiver_task = None
+    prewarm_task = None
 
     # Audio buffer for batching
     audio_buffer = bytearray()
@@ -345,6 +394,22 @@ async def twilio_media_websocket(websocket: WebSocket):
                 logger.info(f"Stream started: {stream_sid}")
                 logger.info(f"Public URL for LLM proxy: {public_url}")
 
+                # Create a stable session key for this call and register
+                # it so the LLM proxy can find it when Deepgram calls back.
+                session_key = f"agent:voice:call:{stream_sid}"
+                _active_sessions[public_url] = session_key
+                # Deepgram calls us from its cloud IPs — register a
+                # catch-all so any caller hitting /v1/chat/completions
+                # during this call gets the right session.
+                _active_sessions["_current"] = session_key
+                logger.info(f"Session key: {session_key}")
+
+                # Pre-warm the OpenClaw session in the background so the
+                # prompt cache is hot by the time the user speaks.
+                prewarm_task = asyncio.create_task(
+                    prewarm_openclaw_session(session_key)
+                )
+
                 # Now send agent config with correct URL
                 config = get_agent_config(public_url)
                 await deepgram_ws.send(json.dumps(config))
@@ -381,8 +446,16 @@ async def twilio_media_websocket(websocket: WebSocket):
             sender_task.cancel()
         if receiver_task:
             receiver_task.cancel()
+        if prewarm_task:
+            prewarm_task.cancel()
         if deepgram_ws:
             await deepgram_ws.close()
+        # Remove session mapping
+        if session_key:
+            _active_sessions.pop("_current", None)
+            for k, v in list(_active_sessions.items()):
+                if v == session_key:
+                    del _active_sessions[k]
         logger.info("Cleanup complete")
 
 
@@ -603,6 +676,65 @@ async def health():
     return {"status": "ok", "service": "deepclaw-voice-agent"}
 
 
+OPENCLAW_VOICE_MODEL = os.getenv(
+    "OPENCLAW_VOICE_MODEL", "anthropic/claude-haiku-4-5-20251001"
+)
+
+
+def ensure_openclaw_voice_agent():
+    """Create the 'voice' OpenClaw agent if it doesn't already exist.
+
+    The voice agent uses a fast model (Haiku by default) to keep
+    time-to-first-token low for real-time phone conversations.
+    """
+    openclaw = shutil.which("openclaw")
+    if not openclaw:
+        logger.warning(
+            "openclaw CLI not found on PATH — skipping voice agent provisioning. "
+            "Install OpenClaw or create the agent manually: "
+            "openclaw agents add voice --model %s",
+            OPENCLAW_VOICE_MODEL,
+        )
+        return
+
+    # Check if the voice agent already exists
+    try:
+        result = subprocess.run(
+            [openclaw, "agents", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if "voice" in result.stdout.split():
+            logger.info("OpenClaw 'voice' agent already exists")
+            return
+    except Exception as exc:
+        logger.warning("Could not list OpenClaw agents: %s", exc)
+        return
+
+    # Create it
+    logger.info(
+        "Creating OpenClaw 'voice' agent with model %s", OPENCLAW_VOICE_MODEL
+    )
+    try:
+        workspace = os.path.join(
+            os.path.expanduser("~"), ".openclaw", "workspace-voice"
+        )
+        subprocess.run(
+            [
+                openclaw, "agents", "add", "voice",
+                "--model", OPENCLAW_VOICE_MODEL,
+                "--workspace", workspace,
+                "--non-interactive",
+            ],
+            capture_output=True, text=True, timeout=15, check=True,
+        )
+        logger.info("OpenClaw 'voice' agent created successfully")
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "Failed to create OpenClaw voice agent: %s\n%s",
+            exc, exc.stderr,
+        )
+
+
 def main():
     """Run the server."""
     import uvicorn
@@ -635,6 +767,8 @@ def main():
     else:
         logger.error(f"Invalid VOICE_PROVIDER: {VOICE_PROVIDER}. Must be 'twilio' or 'telnyx'")
         return
+
+    ensure_openclaw_voice_agent()
 
     logger.info(f"Starting deepclaw voice agent server on {HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT)
