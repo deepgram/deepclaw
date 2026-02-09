@@ -1,6 +1,6 @@
 ---
 name: deepclaw-voice
-description: Set up phone calling to OpenClaw using Deepgram Voice Agent API
+description: First-time setup of the deepclaw voice server (Deepgram + Twilio + OpenClaw). Only use when deepclaw is NOT yet installed or configured.
 requires:
   bins:
     - python3
@@ -10,7 +10,7 @@ requires:
 
 # deepclaw Voice Setup
 
-Use this skill when the user wants to call you on the phone, set up voice calling, or talk to OpenClaw via phone.
+Use this skill ONLY for first-time installation and configuration. If deepclaw is already running, do NOT use this skill — use the control API in TOOLS.md instead.
 
 ## What This Sets Up
 
@@ -26,7 +26,7 @@ Phone calls to OpenClaw using:
 ```bash
 git clone https://github.com/deepgram/deepclaw.git ~/deepclaw
 cd ~/deepclaw
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ### Step 2: Get Deepgram API Key
@@ -65,10 +65,20 @@ If generating new, tell them to add it to `~/.openclaw/openclaw.json` under `gat
 Create `~/deepclaw/.env` with their values:
 ```
 DEEPGRAM_API_KEY=<their_deepgram_key>
+DEEPGRAM_TTS_MODEL=aura-2-thalia-en
 TWILIO_ACCOUNT_SID=<their_sid>
 TWILIO_AUTH_TOKEN=<their_token>
+TWILIO_PHONE_NUMBER=<their_twilio_number>
+OWNER_PHONE=<their_phone_number>
+PUBLIC_URL=<their_ngrok_https_url>
+CONTROL_API_TOKEN=<strong_random_secret>
+CONTROL_API_LOCALHOST_ONLY=true
+TWILIO_VALIDATE_SIGNATURES=true
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 OPENCLAW_GATEWAY_TOKEN=<their_gateway_token>
+VOICE_SHARED_PERSONA_ENABLED=true
+OPENCLAW_MAIN_WORKSPACE=~/.openclaw/workspace
+VOICE_PERSONA_MAX_CHARS=12000
 ```
 
 ### Step 6: Ensure OpenClaw Gateway has chat completions enabled
@@ -90,6 +100,16 @@ Check their `~/.openclaw/openclaw.json` has:
 
 If not, add it and restart the gateway: `openclaw daemon restart`
 
+### Voice persona behavior
+
+deepclaw voice calls inject:
+- shared context from `SOUL.md`, `IDENTITY.md`, and `USER.md` in `OPENCLAW_MAIN_WORKSPACE`
+- a voice overlay policy for concise spoken replies and quick timing notices
+
+If the phone persona feels wrong, verify:
+- `VOICE_SHARED_PERSONA_ENABLED=true`
+- `OPENCLAW_MAIN_WORKSPACE` points to your main OpenClaw workspace
+
 ### Step 7: Start ngrok
 
 ```bash
@@ -106,7 +126,11 @@ Note the HTTPS URL (e.g., `https://abc123.ngrok-free.app`).
    - A Call Comes In: **Webhook**
    - URL: `https://<ngrok-url>/twilio/incoming`
    - Method: **POST**
-4. Save
+4. **Messaging Configuration**:
+   - A Message Comes In: **Webhook**
+   - URL: `https://<ngrok-url>/twilio/sms`
+   - Method: **POST**
+5. Save
 
 ### Step 9: Start Server
 
@@ -124,15 +148,40 @@ Watch the server logs for:
 - "Agent settings applied"
 - "LLM proxy request received"
 
+Then test SMS:
+- Send a text from `OWNER_PHONE` to the Twilio number
+- Confirm deepclaw responds via SMS
+- Send from any other number and confirm no response (silent ignore)
+
 ---
 
 ## Customizing Voice
 
-Edit `~/deepclaw/deepclaw/voice_agent_server.py`, find `get_agent_config()`, change the `model` in `speak`:
+### Default voice (env var)
 
-```python
-"speak": {"provider": {"type": "deepgram", "model": "aura-2-orion-en"}},
+Set the `DEEPGRAM_TTS_MODEL` env var in your `.env` file:
+
 ```
+DEEPGRAM_TTS_MODEL=aura-2-orion-en
+```
+
+### Runtime voice switching (API)
+
+The voice agent can change its own voice via the control API. The caller can ask on a call ("switch to a male British voice") and the agent will update the preference. The change takes effect on the next call.
+
+```bash
+# List available voices with descriptions
+curl -s http://127.0.0.1:8000/api/voice \
+  -H "Authorization: Bearer <CONTROL_API_TOKEN>"
+
+# Set voice by name or description
+curl -s -X POST http://127.0.0.1:8000/api/voice \
+  -H "Authorization: Bearer <CONTROL_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"voice": "pandora"}'
+```
+
+The preference is stored in `~/.deepclaw/voice.txt` and persists across server restarts.
 
 ### Voice Options
 
@@ -151,6 +200,109 @@ Edit `~/deepclaw/deepclaw/voice_agent_server.py`, find `get_agent_config()`, cha
 **Japanese:** ebisu (M), izanami (F)
 
 Format: `aura-2-<name>-<lang>` (e.g., `aura-2-estrella-es`)
+
+---
+
+## Outbound Call/Text Control
+
+deepclaw provides private local endpoints for agent-triggered communication:
+
+- `POST http://127.0.0.1:8000/api/call`
+- `POST http://127.0.0.1:8000/api/sms`
+
+Both require:
+- `Authorization: Bearer <CONTROL_API_TOKEN>`
+- local caller when `CONTROL_API_LOCALHOST_ONLY=true`
+
+Examples:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/call \
+  -H "Authorization: Bearer <CONTROL_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"context": "reason for calling"}'
+
+curl -X POST http://127.0.0.1:8000/api/sms \
+  -H "Authorization: Bearer <CONTROL_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Heartbeat check"}'
+```
+
+Note: destination is always forced to `OWNER_PHONE`. The `context` field on `/api/call` tells the voice agent why it's calling (e.g. "tell the owner a joke", "reminder: meeting in 5 minutes").
+
+### Step 11: Update TOOLS.md with control API and reminders
+
+Add the following to your workspace `TOOLS.md` so you know how to use these endpoints and schedule reminders. Replace `<CONTROL_API_TOKEN>` with the actual token from `.env`:
+
+```markdown
+## Deepclaw Control API
+
+Local endpoints for phone/SMS actions. These are pre-authorized — no confirmation needed.
+
+### Place a phone call to the owner
+\```bash
+curl -s -X POST http://127.0.0.1:8000/api/call \
+  -H "Authorization: Bearer <CONTROL_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"context": "reason for calling, e.g. tell a joke"}'
+\```
+Always include a `context` field describing why you are calling. The voice agent sees this as its first instruction on the call.
+
+### Send an SMS to the owner
+\```bash
+curl -s -X POST http://127.0.0.1:8000/api/sms \
+  -H "Authorization: Bearer <CONTROL_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "your message here"}'
+\```
+
+## Voice Selection
+
+You CAN change your voice. When the caller asks to change your voice, accent, or sound, use this API. Do NOT say you can't — you have full control.
+
+### List available voices
+\```bash
+curl -s http://127.0.0.1:8000/api/voice \
+  -H "Authorization: Bearer <CONTROL_API_TOKEN>"
+\```
+
+### Change voice for future calls
+\```bash
+curl -s -X POST http://127.0.0.1:8000/api/voice \
+  -H "Authorization: Bearer <CONTROL_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"voice": "orion"}'
+\```
+
+Accepts a voice name (e.g. "orion", "pandora") or description (e.g. "female british"). The change takes effect on the next call — tell the caller you've updated it and they'll hear it next time.
+
+## Reminders and Scheduled Actions
+
+Use the `cron` tool to schedule calls, texts, or reminders. The cron job runs an isolated agent with bash access, so it can use the control API above.
+
+### "Call me in 15 minutes"
+Use `cron` tool with:
+- `action`: `"add"`
+- `job.name`: `"call-owner-reminder"` (required — give each job a descriptive name)
+- `job.schedule`: `{"kind": "at", "at": "<ISO-8601 timestamp>"}`
+- `job.sessionTarget`: `"isolated"`
+- `job.deleteAfterRun`: `true`
+- `job.payload`: `{"kind": "agentTurn", "message": "Run this command to call the owner: curl -s -X POST http://127.0.0.1:8000/api/call -H 'Authorization: Bearer <CONTROL_API_TOKEN>' -H 'Content-Type: application/json' -d '{\"context\": \"reminder: <what the reminder is about>\"}'"`}
+
+### "Text me at 9am with the weather"
+Same pattern but use `/api/sms` in the payload message instead of `/api/call`.
+
+### "Remind me in an hour about X"
+Default to SMS for reminders unless the user asks for a call. Include full reminder context in the SMS body.
+
+### Key points
+- Always use `schedule.kind: "at"` with ISO-8601 for one-shot reminders
+- Always use `sessionTarget: "isolated"` so the cron job gets bash access
+- Always set `deleteAfterRun: true` for one-shot reminders
+- **Do NOT set `delivery.mode`** — omit the delivery field entirely
+- For calls: always include a `context` field explaining why you are calling
+- For texts: include the full reminder context in the SMS body
+```
 
 ---
 

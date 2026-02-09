@@ -100,8 +100,17 @@ DEEPGRAM_API_KEY=your_deepgram_api_key
 VOICE_PROVIDER=twilio
 TWILIO_ACCOUNT_SID=your_twilio_account_sid
 TWILIO_AUTH_TOKEN=your_twilio_auth_token
+TWILIO_PHONE_NUMBER=+15551234567
+OWNER_PHONE=+15551234567
+TWILIO_VALIDATE_SIGNATURES=true
+PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
+CONTROL_API_TOKEN=replace_with_random_secret
+CONTROL_API_LOCALHOST_ONLY=true
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 OPENCLAW_GATEWAY_TOKEN=your_openclaw_gateway_token
+VOICE_SHARED_PERSONA_ENABLED=true
+OPENCLAW_MAIN_WORKSPACE=~/.openclaw/workspace
+VOICE_PERSONA_MAX_CHARS=12000
 ```
 
 **For Telnyx:**
@@ -112,6 +121,9 @@ TELNYX_API_KEY=your_telnyx_api_key
 TELNYX_PUBLIC_KEY=your_telnyx_public_key
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 OPENCLAW_GATEWAY_TOKEN=your_openclaw_gateway_token
+VOICE_SHARED_PERSONA_ENABLED=true
+OPENCLAW_MAIN_WORKSPACE=~/.openclaw/workspace
+VOICE_PERSONA_MAX_CHARS=12000
 ```
 
 ### 3. Configure OpenClaw
@@ -135,6 +147,25 @@ Or create the agent manually:
 openclaw agents add voice --model anthropic/claude-haiku-4-5-20251001
 ```
 
+### Voice Personality and Tool Behavior
+
+deepclaw keeps the fast `openclaw/voice` model route, but now injects two prompts into voice proxy requests:
+
+- **Shared personality context** from your main OpenClaw workspace files:
+  - `SOUL.md`
+  - `IDENTITY.md`
+  - `USER.md`
+- **Voice behavior overlay** with phone-specific policy:
+  - concise spoken responses
+  - heads-up before operations expected to take more than 2 seconds
+  - confirmation before operations expected to take more than 6 seconds or cause side effects
+
+This means you can keep one core personality for chat and voice, while still using voice-safe response behavior.
+
+Notes:
+- This does **not** include automatic long-task SMS follow-up yet.
+- If voice feels off-persona, verify `OPENCLAW_MAIN_WORKSPACE` and `VOICE_SHARED_PERSONA_ENABLED`.
+
 ### 4. Start the tunnel
 
 ```bash
@@ -154,7 +185,11 @@ Note your ngrok URL (e.g., `https://abc123.ngrok-free.app`).
    - Set "A Call Comes In" to **Webhook**
    - URL: `https://your-ngrok-url.ngrok-free.app/twilio/incoming`
    - Method: **POST**
-5. Save
+5. Under "Messaging Configuration":
+   - Set "A Message Comes In" to **Webhook**
+   - URL: `https://your-ngrok-url.ngrok-free.app/twilio/sms`
+   - Method: **POST**
+6. Save
 
 #### Option B: Configure Telnyx
 
@@ -187,6 +222,32 @@ python -m deepclaw
 ### 7. Call your number
 
 Pick up the phone and talk to your OpenClaw!
+
+### 8. Trigger outbound call/text securely (optional)
+
+deepclaw exposes local control endpoints that are intended for trusted local callers only:
+
+- `POST /api/call` - trigger an outbound call to `OWNER_PHONE`
+- `POST /api/sms` - send an outbound SMS to `OWNER_PHONE`
+
+Both require:
+
+- `Authorization: Bearer $CONTROL_API_TOKEN`
+- local-origin access when `CONTROL_API_LOCALHOST_ONLY=true` (default)
+
+Examples:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/call \
+  -H "Authorization: Bearer $CONTROL_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+curl -X POST http://127.0.0.1:8000/api/sms \
+  -H "Authorization: Bearer $CONTROL_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Heartbeat check: all systems normal."}'
+```
 
 ## Architecture
 
@@ -248,20 +309,33 @@ Be aware of these security considerations when using OpenClaw and deepclaw. Like
 - Anyone who discovers your ngrok URL can use your OpenClaw/Anthropic API credits
 - **Mitigation:** Keep your ngrok URL private. Consider using a fixed ngrok domain.
 
-**2. No Twilio signature validation**
-- Incoming webhook requests are not verified as coming from Twilio
-- **Mitigation:** For production, add [Twilio request validation](https://www.twilio.com/docs/usage/security#validating-requests)
+**2. Twilio webhook signature validation must stay enabled**
+- deepclaw validates `X-Twilio-Signature` by default (`TWILIO_VALIDATE_SIGNATURES=true`)
+- Signature checks depend on the public URL; set `PUBLIC_URL` to your exact external webhook base URL
+- **Mitigation:** Do not disable signature validation outside local debugging.
 
-**3. Credentials in `.env` file**
+**3. Owner-only policy is enforced server-side**
+- Inbound voice and SMS are only accepted from `OWNER_PHONE`
+- Outbound `/api/call` and `/api/sms` always target `OWNER_PHONE` (caller-provided destination is ignored)
+- **Mitigation:** Set `OWNER_PHONE` explicitly and treat it as the single source of truth.
+
+**4. Control endpoints are sensitive**
+- `/api/call` and `/api/sms` require bearer auth via `CONTROL_API_TOKEN`
+- `CONTROL_API_LOCALHOST_ONLY=true` restricts these endpoints to local callers by default
+- **Mitigation:** Keep the token secret and avoid exposing control endpoints publicly.
+
+**5. Credentials in `.env` file**
 - API keys and tokens are stored in plaintext
 - **Mitigation:** The file is gitignored. Set restrictive permissions: `chmod 600 .env`
 
-**4. ngrok exposes your local machine**
+**6. ngrok exposes your local machine**
 - Your server is accessible from the internet while running
 - **Mitigation:** Only run when needed. Use ngrok's IP allowlist on paid plans.
 
 **For production deployments**, consider:
-- Adding Twilio signature validation
+- Keeping Twilio signature validation enabled at all times
+- Running with owner-only policy (`OWNER_PHONE`) instead of open caller lists
+- Keeping control endpoints local-only and token-protected
 - Running behind a reverse proxy with rate limiting
 - Using a dedicated server instead of ngrok
 - Implementing proper authentication on the LLM proxy
@@ -273,6 +347,8 @@ Be aware of these security considerations when using OpenClaw and deepclaw. Like
 The initial greeting is instant (generated by Deepgram), but subsequent responses wait for OpenClaw's buffer.
 
 This is an upstream limitation. OpenClaw's native WebSocket agent endpoint streams properly, but external voice APIs require the OpenAI-compatible chat completions endpoint.
+
+**No automatic follow-up orchestration yet:** deepclaw does not yet send guaranteed background follow-up SMS/call updates for long-running tasks.
 
 ## Coming Soon
 
