@@ -51,6 +51,10 @@ TELNYX_PUBLIC_KEY = os.getenv("TELNYX_PUBLIC_KEY", "")
 # Generate a random proxy secret on startup (Deepgram will send this back to us)
 PROXY_SECRET = os.getenv("PROXY_SECRET", secrets.token_hex(16))
 
+# Voice agent system prompt (customizable via environment)
+DEFAULT_VOICE_PROMPT = "You are a helpful voice assistant on a phone call. Keep responses concise and conversational (1-3 sentences). Never use markdown, bullet points, numbered lists, or emojis - your responses will be spoken aloud."
+VOICE_SYSTEM_PROMPT = os.getenv("VOICE_SYSTEM_PROMPT", DEFAULT_VOICE_PROMPT)
+
 DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse"
 
 app = FastAPI(title="deepclaw-voice-agent")
@@ -248,7 +252,7 @@ def get_agent_config(public_url: str) -> dict:
                 "endpoint": {
                     "url": llm_url,
                 },
-                "prompt": "You are a helpful voice assistant on a phone call. Keep responses concise and conversational (1-3 sentences). Never use markdown, bullet points, numbered lists, or emojis - your responses will be spoken aloud.",
+                "prompt": VOICE_SYSTEM_PROMPT,
             },
             "speak": {
                 "provider": {
