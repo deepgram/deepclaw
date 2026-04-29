@@ -479,10 +479,15 @@ async def telnyx_webhook(request: Request):
         host = request.headers.get("host", "localhost:8000")
         stream_url = f"wss://{host}/telnyx/media"
         
-        # Answer the call with media streaming
+        # Answer the call with media streaming.
+        # `stream_bidirectional_mode` is required for Telnyx to play audio we
+        # send back over the WebSocket; without it the stream is inbound-only
+        # and the caller never hears the agent's TTS.
         answer_data = {
             "stream_url": stream_url,
-            "stream_track": "both_tracks"
+            "stream_track": "both_tracks",
+            "stream_bidirectional_mode": "rtp",
+            "stream_bidirectional_codec": "PCMU",
         }
         
         headers = {
